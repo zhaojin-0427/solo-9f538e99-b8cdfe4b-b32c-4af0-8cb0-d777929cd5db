@@ -44,6 +44,14 @@ CREATE TABLE IF NOT EXISTS connections (
 );
 CREATE INDEX IF NOT EXISTS idx_connections_succ ON connections(day, succ);
 CREATE INDEX IF NOT EXISTS idx_trips_day_actual ON trips(day, actual);
+-- 运营日可行性标记：局部批次校验只对"当前 horizon 下已验证可行"的运营日启用。
+-- 旧库没有该表时由 IF NOT EXISTS 自动补建；缺标记的运营日首次批录自动做一次
+-- 全日校验并补写标记，无需重新导入计划。
+CREATE TABLE IF NOT EXISTS day_state (
+    day       TEXT PRIMARY KEY REFERENCES days(day) ON DELETE CASCADE,
+    feasible  INTEGER NOT NULL,          -- 已提交计划+实发是否存在合法补全（1=是）
+    horizon   INTEGER NOT NULL           -- 校验标记对应的运营日分钟上界
+);
 """
 
 

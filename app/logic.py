@@ -12,15 +12,18 @@
   等待对每个前序实发单调不减，且"全部取最早"/"全部取最晚"各自都是合法补全，
   因此区间端点分别由 EF、LF 给出。
 - 单班查询只走该班前序的祖先/子孙子图（DayGraph 按需取数），不遍历全日接续。
-- 可行性校验（每次计划导入与实发批次后，在写事务内执行）：
+- 可行性校验（计划导入在写事务内做全日校验；实发批次默认走局部前向传播）：
   全日按拓扑序传播 EF、逆拓扑序传播 LF：
     1) 有实发班次：实发 < 所需最早时刻  → 矛盾（冲突时刻 + 接续链）；
     2) 无实发班次：EF > LF（已知实发把它逼到运营日之外）→ 矛盾。
-  校验不过整体回滚，保证库中数据始终存在至少一个合法补全，
-  因此等待区间恒有 min_wait <= max_wait。
+  局部校验只从本批改动班沿后继传播 EF，在"重算 EF = 已提交 EF"的节点剪枝，
+  不预读全日；已提交状态可行时矛盾必在局部传播内暴露，发现矛盾再回退全日
+  校验生成与原实现一致的冲突明细。校验不过整体回滚，保证库中数据始终存在
+  至少一个合法补全，因此等待区间恒有 min_wait <= max_wait。
 """
 from __future__ import annotations
 
+import heapq
 from collections import deque
 
 from .db import write_txn
@@ -55,6 +58,21 @@ class BatchConflict(Exception):
         super().__init__("conflicting actuals")
         self.conflicts = conflicts
         self.total = total
+
+
+class _OverrideRow:
+    """全日校验时在内存中覆盖某班实发（批次尚未/不必落库）。"""
+
+    __slots__ = ("trip_id", "planned", "actual", "topo")
+
+    def __init__(self, row, actual):
+        self.trip_id = row["trip_id"]
+        self.planned = row["planned"]
+        self.actual = actual
+        self.topo = row["topo"]
+
+    def __getitem__(self, key):
+        return getattr(self, key)
 
 
 # ---------------------------------------------------------------- 计划导入
@@ -139,6 +157,10 @@ def import_plan(conn, day: str, trips, connections, horizon_minutes: int) -> dic
                 "计划在运营日时长内不可行（接续链超出可排范围）",
                 {"total_conflicts": total, "conflicts": conflicts},
             )
+        conn.execute(
+            "INSERT INTO day_state(day, feasible, horizon) VALUES (?, 1, ?)",
+            (day, horizon_minutes),
+        )
     return {"trips": len(trips), "connections": len(edges)}
 
 
@@ -147,7 +169,11 @@ def import_plan(conn, day: str, trips, connections, horizon_minutes: int) -> dic
 def apply_actuals(conn, day: str, updates, horizon_minutes: int) -> int:
     """补录/更正/撤销一批实发（actual 为 None 即撤销）。
 
-    逐条校验 -> 写入 -> 全日可行性校验，任一步失败整体回滚，保留原实发。
+    逐条 400 校验 -> 可行性校验 -> 整批通过才落库，任一步失败整体回滚，
+    保留原实发。可行性校验默认走局部传播（只读改动班的可达子图，在 EF 未变
+    的节点处剪枝）；发现冲突或运营日缺少当前 horizon 的可行性标记（旧库首次
+    使用、horizon 配置变更）时回退全日校验，409 的冲突总数、顺序、明细与
+    全日校验完全一致。
     """
     seen: set[str] = set()
     for u in updates:
@@ -178,28 +204,240 @@ def apply_actuals(conn, day: str, updates, horizon_minutes: int) -> int:
                     "实发不得早于计划",
                     {"trip_id": u.trip_id, "planned": planned[u.trip_id], "actual": u.actual},
                 )
+
+        overrides = {u.trip_id: u.actual for u in updates}
+        state = None
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='day_state'"
+        ).fetchone():
+            state = conn.execute(
+                "SELECT feasible, horizon FROM day_state WHERE day = ?", (day,)
+            ).fetchone()
+        # 缺表（旧库）或缺当日标记：state=None 触发一次全日引导校验
+        local_eligible = (
+            state is not None
+            and bool(state["feasible"])
+            and state["horizon"] == horizon_minutes
+        )
+
+        if local_eligible:
+            if incremental_check_feasible(conn, day, overrides, horizon_minutes):
+                # 局部校验发现矛盾：回退全日校验，保证冲突明细与原实现一致
+                total, conflicts = check_feasibility(
+                    conn, day, horizon_minutes, overrides
+                )
+                raise BatchConflict(conflicts, total)
+        else:
+            # 旧库首次批录 / horizon 变更：批次仅在内存覆盖，做一次全日引导校验
+            total, conflicts = check_feasibility(
+                conn, day, horizon_minutes, overrides
+            )
+            if total:
+                raise BatchConflict(conflicts, total)
+
+        # 整批通过才提交
         for u in updates:
             conn.execute(
                 "UPDATE trips SET actual = ? WHERE day = ? AND trip_id = ?",
                 (u.actual, day, u.trip_id),
             )
-        total, conflicts = check_feasibility(conn, day, horizon_minutes)
-        if total:
-            raise BatchConflict(conflicts, total)
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='day_state'"
+        ).fetchone():
+            # 旧库首次使用：自动补建标记表，无需重新导入计划
+            conn.execute(
+                "CREATE TABLE day_state ("
+                "day TEXT PRIMARY KEY REFERENCES days(day) ON DELETE CASCADE, "
+                "feasible INTEGER NOT NULL, horizon INTEGER NOT NULL)"
+            )
+        if state is None:
+            conn.execute(
+                "INSERT INTO day_state(day, feasible, horizon) VALUES (?, 1, ?)",
+                (day, horizon_minutes),
+            )
+        elif state["horizon"] != horizon_minutes:
+            conn.execute(
+                "UPDATE day_state SET feasible = 1, horizon = ? WHERE day = ?",
+                (horizon_minutes, day),
+            )
     return len(updates)
 
 
-def check_feasibility(conn, day: str, horizon_minutes: int) -> tuple[int, list[dict]]:
+class _LocalView:
+    """局部校验的按需取数视图：库中已提交数据 + 本批内存覆盖。
+
+    所有读取都按单个班次/单班接续清单发起，绝不预读全日；并统计访问量
+    （trip_reads / edge_reads），供自测证明局部性。
+    """
+
+    def __init__(self, conn, day: str, overrides: dict[str, int | None]):
+        self.conn = conn
+        self.day = day
+        self.overrides = overrides
+        self._trip_cache: dict[str, object] = {}
+        self._preds_cache: dict[str, list[tuple[str, int]]] = {}
+        self._succs_cache: dict[str, list[tuple[str, int]]] = {}
+        self._committed_rows: dict[str, object] = {}
+        self._committed_ef: dict[str, int] = {}
+        self.trip_reads = 0
+        self.edge_reads = 0
+
+    def trip(self, tid: str):
+        """生效行（含本批覆盖）。"""
+        if tid not in self._trip_cache:
+            row = self.conn.execute(
+                "SELECT trip_id, planned, actual, topo FROM trips "
+                "WHERE day = ? AND trip_id = ?",
+                (self.day, tid),
+            ).fetchone()
+            self.trip_reads += 1
+            if tid in self.overrides:
+                row = _OverrideRow(row, self.overrides[tid])
+            self._trip_cache[tid] = row
+        return self._trip_cache[tid]
+
+    def predecessors(self, tid: str) -> list[tuple[str, int]]:
+        if tid not in self._preds_cache:
+            rows = self.conn.execute(
+                "SELECT pred, min_interval FROM connections WHERE day = ? AND succ = ?",
+                (self.day, tid),
+            ).fetchall()
+            self.edge_reads += 1
+            self._preds_cache[tid] = [(r["pred"], r["min_interval"]) for r in rows]
+        return self._preds_cache[tid]
+
+    def successors(self, tid: str) -> list[tuple[str, int]]:
+        if tid not in self._succs_cache:
+            rows = self.conn.execute(
+                "SELECT succ, min_interval FROM connections WHERE day = ? AND pred = ?",
+                (self.day, tid),
+            ).fetchall()
+            self.edge_reads += 1
+            self._succs_cache[tid] = [(r["succ"], r["min_interval"]) for r in rows]
+        return self._succs_cache[tid]
+
+    def _committed_row(self, tid: str):
+        """绕过本批覆盖的已提交行（仅 committed_ef 使用）。"""
+        if tid not in self.overrides:
+            return self.trip(tid)
+        if tid not in self._committed_rows:
+            row = self.conn.execute(
+                "SELECT trip_id, planned, actual, topo FROM trips "
+                "WHERE day = ? AND trip_id = ?",
+                (self.day, tid),
+            ).fetchone()
+            self.trip_reads += 1
+            self._committed_rows[tid] = row
+        return self._committed_rows[tid]
+
+    def committed_ef(self, tid: str) -> int:
+        """已提交状态（不含本批）下 tid 的最早可行时刻，迭代沿前序回溯，结果记忆化。"""
+        memo = self._committed_ef
+        stack = [(tid, False)]
+        seen: set[str] = set()
+        while stack:
+            node, expanded = stack.pop()
+            if not expanded:
+                if node in memo:
+                    continue
+                if node in seen:
+                    continue
+                seen.add(node)
+                stack.append((node, True))
+                for pred, _m in self.predecessors(node):
+                    if pred not in memo and pred not in seen:
+                        stack.append((pred, False))
+                continue
+            row = self._committed_row(node)
+            if row["actual"] is not None:
+                memo[node] = row["actual"]
+                continue
+            value = row["planned"]
+            for pred, m in self.predecessors(node):
+                value = max(value, memo[pred] + m)
+            memo[node] = value
+        return memo[tid]
+
+
+def _incremental_propagate(view: "_LocalView", horizon_minutes: int) -> bool:
+    """在给定局部视图上做前向 EF 传播，返回是否发现矛盾（供校验与访问量自测共用）。"""
+    heap = [(view.trip(t)["topo"], t) for t in view.overrides]
+    heapq.heapify(heap)
+    discovered = set(view.overrides)
+    new_ef: dict[str, int] = {}
+    conflict = False
+
+    while heap:
+        _topo, tid = heapq.heappop(heap)
+        row = view.trip(tid)
+        required = row["planned"]
+        for pred, m in view.predecessors(tid):
+            pred_ef = new_ef[pred] if pred in new_ef else view.committed_ef(pred)
+            required = max(required, pred_ef + m)
+        actual = row["actual"]  # 已含本批覆盖
+        if actual is not None:
+            if actual < required:
+                conflict = True  # 类型 1：实发早于所需最早时刻
+            ef = max(required, actual)
+        else:
+            ef = required
+            if ef >= horizon_minutes:
+                conflict = True  # 类型 2：未知班被已知实发逼出运营日
+        new_ef[tid] = ef
+
+        # 剪枝：EF 与已提交值相同，后继不受本批影响（本点自身的冲突仍已记录）
+        if ef == view.committed_ef(tid):
+            continue
+        for succ, _m in view.successors(tid):
+            if succ not in discovered:
+                discovered.add(succ)
+                heapq.heappush(heap, (view.trip(succ)["topo"], succ))
+    return conflict
+
+
+def incremental_check_feasible(
+    conn, day: str, overrides: dict[str, int | None], horizon_minutes: int
+) -> bool:
+    """局部可行性校验：返回 True 表示批次与约束矛盾，False 表示整批可行。
+
+    只从本批改动班出发沿后继传播 EF：
+      - 工作集按 topo 取最小堆，保证节点计算时所有受影响前序已定稿，每点只算一次；
+      - 某点重算 EF 与已提交 EF 相同即剪枝，不再展开后继——汇合班次最早可行
+        发车时刻未变时，汇合后的长链一次都不读；
+      - 已提交状态可行时，矛盾只有两种：有实发班 actual < 所需最早时刻（类型 1），
+        或未知班 EF 越出运营日（类型 2，等价于 EF > LF）；类型 2 的另一成因
+        （被下游已知实发压制）必表现为下游某已知班的类型 1 冲突，同样在本
+        传播中被发现。
+    """
+    if not overrides:
+        return False
+    view = _LocalView(conn, day, overrides)
+    return _incremental_propagate(view, horizon_minutes)
+
+
+def check_feasibility(
+    conn,
+    day: str,
+    horizon_minutes: int,
+    overrides: dict[str, int | None] | None = None,
+) -> tuple[int, list[dict]]:
     """全日 EF/LF 双向传播，返回 (矛盾总数, 前 N 条矛盾详情)。
+
+    overrides 给出批次生效后的实发覆盖（None 表示撤销）；为空时按库中已提交
+    实发校验。冲突枚举顺序与明细格式由本函数唯一决定，局部校验发现冲突后回退
+    到这里，保证 409 响应与全日校验逐字节一致。
 
     矛盾只会以两种形式出现（未知班次在两者之间总能取到合法值）：
       1) actual_before_required：有实发班次的实发早于其所需最早时刻；
       2) no_feasible_completion：无实发班次被已知实发逼到 EF > LF。
     """
+    overrides = overrides or {}
     trips = {}
     for r in conn.execute(
         "SELECT trip_id, planned, actual, topo FROM trips WHERE day = ?", (day,)
     ):
+        if r["trip_id"] in overrides:
+            r = _OverrideRow(r, overrides[r["trip_id"]])
         trips[r["trip_id"]] = r
     preds: dict[str, list[tuple[str, int]]] = {}
     succs: dict[str, list[tuple[str, int]]] = {}
@@ -212,6 +450,7 @@ def check_feasibility(conn, day: str, horizon_minutes: int) -> tuple[int, list[d
 
     ef: dict[str, int] = {}
     conflicts: list[dict] = []
+    total = 0  # 矛盾总数；明细只为前 MAX_CONFLICTS_REPORTED 条构建，避免长链 O(n²) 内存
     for r in ordered:
         tid = r["trip_id"]
         required = r["planned"]
@@ -221,9 +460,11 @@ def check_feasibility(conn, day: str, horizon_minutes: int) -> tuple[int, list[d
         if actual is not None:
             if actual < required:
                 ef[tid] = required  # 按所需时刻继续传播，暴露下游级联矛盾
-                conflicts.append(
-                    _conflict_payload("actual_before_required", tid, trips, preds, ef)
-                )
+                total += 1
+                if len(conflicts) < MAX_CONFLICTS_REPORTED:
+                    conflicts.append(
+                        _conflict_payload("actual_before_required", tid, trips, preds, ef)
+                    )
             else:
                 ef[tid] = actual
         else:
@@ -243,13 +484,15 @@ def check_feasibility(conn, day: str, horizon_minutes: int) -> tuple[int, list[d
     for r in ordered:
         tid = r["trip_id"]
         if r["actual"] is None and ef[tid] > lf[tid]:
-            conflicts.append(
-                _conflict_payload(
-                    "no_feasible_completion", tid, trips, preds, ef, latest=lf[tid]
+            total += 1
+            if len(conflicts) < MAX_CONFLICTS_REPORTED:
+                conflicts.append(
+                    _conflict_payload(
+                        "no_feasible_completion", tid, trips, preds, ef, latest=lf[tid]
+                    )
                 )
-            )
 
-    return len(conflicts), conflicts[:MAX_CONFLICTS_REPORTED]
+    return total, conflicts
 
 
 def _conflict_payload(kind, tid, trips, preds, ef, latest=None) -> dict:

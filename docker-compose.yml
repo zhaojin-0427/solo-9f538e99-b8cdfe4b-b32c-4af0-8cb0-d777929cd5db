@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/app.db
+      # 运营日分钟数上界（不含），默认 2880 = 48 小时
+      DAY_HORIZON_MINUTES: "2880"
+    volumes:
+      - busdata:/data
+    restart: unless-stopped
+
+volumes:
+  busdata:
